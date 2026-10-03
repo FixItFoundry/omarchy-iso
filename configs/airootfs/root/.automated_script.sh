@@ -44,12 +44,6 @@ set_tokyo_night_colors
 mkdir -p /var/log
 touch "$OMARCHY_INSTALL_LOG_FILE"
 
-# Clamp unbacked ARM RTC forward so package and keyring operations succeed offline
-if [[ "$(date +%Y)" -lt 2025 ]]; then
-  date -s "@$(stat -c %Y /usr/share/omarchy-iso/build-info 2>/dev/null || stat -c %Y /etc/os-release)" 2>/dev/null || true
-  hwclock --systohc 2>/dev/null || true
-fi
-
 export COLUMNS=$(tput cols)
 export LINES=$(tput lines)
 exec > >(tee >(sed -u 's/\x1b\[[0-9;?]*[A-Za-z]//g' >>"$OMARCHY_INSTALL_LOG_FILE") 2>/dev/null) 2>/dev/tty
