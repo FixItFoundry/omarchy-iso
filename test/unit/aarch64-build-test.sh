@@ -20,7 +20,7 @@ bash -n "$ROOT/bin/omarchy-iso-make" "$ROOT/builder/build-iso.sh" \
   "$ROOT/builder/node-release.sh" "$ROOT/builder/arm64-kernel-image.sh" \
   "$ROOT/builder/n1x-dev-ssh/omarchy-n1x-dev-ssh" "$ROOT/configs/airootfs/root/.automated_script.sh"
 
-grep -Fq 'menci/archlinuxarm@sha256:' "$ROOT/bin/omarchy-iso-make" || fail "aarch64 container is not pinned by digest"
+grep -Eq '^ *CONTAINER_IMAGE=ghcr\.io/menci/archlinuxarm@sha256:[0-9a-f]{64}$' "$ROOT/bin/omarchy-iso-make" || fail "aarch64 container is not pinned by digest on ghcr.io"
 grep -Eq 'requires? (--package-dir DIR|the package bundle)' "$ROOT/bin/omarchy-iso-make" "$ROOT/builder/build-iso.sh" \
   && fail "an aarch64 build still requires a package bundle, though edge publishes linux-omarchy"
 grep -Fq 'ships no $required' "$ROOT/builder/build-iso.sh" || fail "a runtime without the platform support is not refused"
@@ -32,7 +32,7 @@ done
 grep -Fq 'sha256sum --check --strict --quiet SHA256SUMS' "$ROOT/bin/omarchy-iso-make" || fail "bundle checksums are not verified on the host"
 grep -Fq -- '-v "$PACKAGE_DIR:/packages:ro"' "$ROOT/bin/omarchy-iso-make" || fail "bundle is not mounted read-only at /packages"
 grep -Fq 'OMARCHY_ARCH == x86_64 && -d /var/cache/pacman/pkg' "$ROOT/bin/omarchy-iso-make" || fail "host pacman cache would leak into aarch64 builds"
-grep -Fq 'builds use the edge channel' "$ROOT/bin/omarchy-iso-make" || fail "aarch64 builds must be pinned to the edge channel"
+grep -Fq 'aarch64 builds use the stable, rc or edge channel' "$ROOT/builder/build-iso.sh" || fail "an aarch64 build accepts a channel it has no config for"
 grep -Fq 'OMARCHY_KERNEL=linux-omarchy' "$ROOT/bin/omarchy-iso-make" || fail "an aarch64 image does not boot linux-omarchy"
 grep -Fq -- '--kernel' "$ROOT/bin/omarchy-iso-make" && fail "an aarch64 build still offers a choice of kernel"
 grep -Fq 'OMARCHY_ARM_PLATFORM' "$ROOT/bin/omarchy-iso-make" "$ROOT/builder/build-iso.sh" && fail "an aarch64 build still asks which board it is for"
@@ -40,7 +40,7 @@ grep -Fq "ALL_kver='/boot/vmlinuz-linux-omarchy'" "$ROOT/builder/linux-omarchy.p
 grep -Fq 'echo "$OMARCHY_KERNEL" > "$build_cache_dir/airootfs/root/omarchy_kernel"' "$ROOT/builder/build-iso.sh" || fail "the installer is not told which kernel to install"
 
 # --- builder wiring -----------------------------------------------------------
-grep -Fq 'online_pacman_conf=/configs/pacman-online-aarch64.conf' "$ROOT/builder/build-iso.sh" || fail "aarch64 does not use its own online pacman config"
+grep -Fq 'online_pacman_conf="/configs/pacman-online-aarch64-${OMARCHY_MIRROR}.conf"' "$ROOT/builder/build-iso.sh" || fail "aarch64 does not use its own online pacman config for the channel"
 if grep -Fq 'pacman-online-${OMARCHY_MIRROR}.conf --noconfirm' "$ROOT/builder/build-iso.sh"; then
   fail "a pacman call still hardcodes the x86 mirror config"
 fi
@@ -50,10 +50,21 @@ grep -Fq 'boot_splash_kernel_options="quiet splash "' "$ROOT/builder/build-iso.s
 grep -Fq 'plymouth.enable=0 console=tty0' "$ROOT/builder/build-iso.sh" && fail "aarch64 live boot still turns Plymouth off"
 grep -Fq '"$mkarchiso_command" -v -w' "$ROOT/builder/build-iso.sh" || fail "builder does not use the patched mkarchiso on aarch64"
 # pacman takes the first repository carrying a name: the platform bundle, then
-# Omarchy's edge aarch64 repo, then Arch Linux ARM.
-repos=$(grep -E '^\[|^Server' "$ROOT/configs/pacman-online-aarch64.conf" | grep -v '^\[options\]' | paste -sd' ')
-[[ $repos == '[platform] Server = file:///packages [omarchy] Server = https://pkgs.omarchy.org/edge/$arch [core]'* ]] \
-  || fail "aarch64 repository order is wrong: $repos"
+# Omarchy's aarch64 repo, then Arch Linux ARM. Each channel's config is edge's
+# with that channel's [omarchy] repo and Arch Linux ARM mirror, as x86_64's
+# pacman-online-<channel>.conf are.
+for channel in stable rc edge; do
+  conf=$ROOT/configs/pacman-online-aarch64-$channel.conf
+  [[ -f $conf ]] || fail "no aarch64 online pacman config for $channel"
+  host=arm-mirror.omarchy.org
+  [[ $channel == edge ]] || host=arm-$channel-mirror.omarchy.org
+  repos=$(grep -E '^\[|^Server' "$conf" | grep -v '^\[options\]' | paste -sd' ')
+  [[ $repos == "[platform] Server = file:///packages [omarchy] Server = https://pkgs.omarchy.org/$channel/\$arch [core] Server = https://$host/\$arch/\$repo [extra] Server = https://$host/\$arch/\$repo [alarm] Server = https://$host/\$arch/\$repo [aur] Server = https://$host/\$arch/\$repo" ]] \
+    || fail "aarch64 $channel repositories are wrong: $repos"
+  diff <(grep -Ev '^Server|^#' "$ROOT/configs/pacman-online-aarch64-edge.conf") <(grep -Ev '^Server|^#' "$conf") >/dev/null \
+    || fail "aarch64 $channel config differs from edge's in more than its servers"
+done
+grep -Fq 'sed -i "s|^Server = https://pkgs' "$ROOT/builder/build-iso.sh" && fail "an aarch64 build still rewrites its [omarchy] server"
 grep -Fq 'repo-add -q "$bundle_index/platform.db.tar.gz"' "$ROOT/builder/build-iso.sh" || fail "bundle is not indexed as the [platform] repo"
 grep -Fq 'arch="${OMARCHY_ARCH:-x86_64}"' "$ROOT/configs/profiledef.sh" || fail "profiledef ignores OMARCHY_ARCH"
 
@@ -135,7 +146,7 @@ grep -Fq 'kernel_options="console=tty0 acpi=nospcr initramfs_async=0"' "$ROOT/bu
 # Without a bundle the [platform] repo must go: pacman refuses a repo it cannot sync.
 strip=$(grep -F "awk '/^\\[platform\\]$/" "$ROOT/builder/build-iso.sh" | sed -E "s/.*awk '([^']*)'.*/\1/")
 [[ -n $strip ]] || fail "builds without a bundle keep the [platform] repo"
-stripped=$(awk "$strip" "$ROOT/configs/pacman-online-aarch64.conf" | grep -E '^\[' | paste -sd' ')
+stripped=$(awk "$strip" "$ROOT/configs/pacman-online-aarch64-stable.conf" | grep -E '^\[' | paste -sd' ')
 [[ $stripped == '[options] [omarchy] [core] [extra] [alarm] [aur]' ]] || fail "repositories without a bundle are wrong: $stripped"
 # The entrypoint's contract, checked by running it up to its first refusal.
 make_refuses() { # expected message, then arguments
@@ -143,7 +154,7 @@ make_refuses() { # expected message, then arguments
   out=$(cd "$ROOT" && bash bin/omarchy-iso-make "$@" 2>&1) && fail "omarchy-iso-make $* was accepted"
   grep -Fq -- "$want" <<<"$out" || fail "omarchy-iso-make $*: expected '$want', got: $out"
 }
-make_refuses 'builds use the edge channel' --arch aarch64
+make_refuses 'package directory not found' --arch aarch64 --rc --package-dir /nonexistent
 make_refuses 'package directory not found' --arch aarch64 --edge --package-dir /nonexistent
 make_refuses 'Unknown option: --kernel' --arch aarch64 --edge --kernel linux-aarch64
 make_refuses 'only valid with --arch aarch64' --package-dir /tmp
@@ -153,7 +164,7 @@ make_refuses 'Unknown option: --platform' --arch aarch64 --platform n1x --edge
 # firmware provides none. Every image tries to build one from its own kernel.
 uki="$ROOT/builder/qualcomm/live-uki.sh"
 bash -n "$uki"
-grep -Fq 'parted systemd-ukify linux-firmware-qcom qcom-firmware-extract asus-zenbook-a16-firmware python)' "$ROOT/builder/build-iso.sh" \
+grep -Fq 'parted systemd-ukify linux-firmware-qcom qcom-firmware-extract python)' "$ROOT/builder/build-iso.sh" \
   || fail "the live image lacks ukify or the Snapdragon firmware tools"
 # The UKI is built in the image's customize step, once pacstrap has made the
 # kernel and initramfs it wraps.
@@ -185,11 +196,15 @@ grep -Fq 'patch --batch --forward --fuzz=0 "$mkarchiso_command" </builder/archis
 # The installer asks the runtime's own detector which board it is on.
 grep -Fq 'install -Dm0644 "$hw_platform" "$build_cache_dir/airootfs/usr/share/omarchy-iso/omarchy-hw-platform"' "$ROOT/builder/build-iso.sh" \
   || fail "the image does not carry the runtime's platform detector"
+# A packaged runtime links /usr/share/omarchy/bin/* to /usr/bin, so the link
+# extracted on its own points nowhere.
+grep -Fq 'hw_platform=/tmp/omarchy-pkglists/usr/bin/omarchy-hw-platform' "$ROOT/builder/build-iso.sh" \
+  || fail "a build from published packages reads the detector through its link"
 
 # --- package sources ---------------------------------------------------------------
 # Arch Linux ARM's packages come from Omarchy's own mirror of them: for the
 # offline mirror, for the build container, and for the installed system.
-servers=$(grep -E '^Server' "$ROOT/configs/pacman-online-aarch64.conf" | grep -v 'file:///packages' | sort -u)
+servers=$(cat "$ROOT"/configs/pacman-online-aarch64-*.conf | grep -E '^Server' | grep -v 'file:///packages' | sort -u)
 grep -vq 'omarchy\.org/' <<<"$servers" && fail "an aarch64 build downloads from outside Omarchy: $(grep -v 'omarchy\.org/' <<<"$servers")"
 grep -Fq 'Server = https://arm-mirror.omarchy.org/$arch/$repo' <<<"$servers" || fail "aarch64 builds do not use Omarchy's Arch Linux ARM mirror"
 grep -Fq '>/etc/pacman.d/mirrorlist' "$ROOT/builder/build-iso.sh" || fail "the build container keeps the mirror its image came with"
@@ -290,3 +305,24 @@ done
 [[ " $live_modules " != *" qcom_q6v5_pas"* ]] || fail "the live initramfs loads the DSP driver"
 
 echo "aarch64 build overlay tests passed"
+
+# Public images must never install the private A16 firmware package.
+if grep -Eq 'arch_packages=.*asus-zenbook-a16-firmware' "$ROOT/builder/build-iso.sh"; then
+  fail 'private A16 firmware is still included in the public image'
+fi
+source "$ROOT/builder/qualcomm/public-firmware.sh"
+public_root=$(mktemp -d)
+check_public_a16_firmware "$public_root" || fail 'clean public root rejected'
+mkdir -p "$public_root/usr/lib/firmware/updates/qcom/glymur/ASUSTeK/UX3607OA"
+echo private > "$public_root/usr/lib/firmware/updates/qcom/glymur/ASUSTeK/UX3607OA/qcadsp8480.mbn"
+if check_public_a16_firmware "$public_root" 2>/dev/null; then
+  fail 'public image accepted an OEM DSP payload'
+fi
+rm -rf "$public_root"
+mkdir -p "$public_root/offline"
+touch "$public_root/offline/asus-zenbook-a16-firmware-1-aarch64.pkg.tar.zst"
+if check_public_a16_firmware "$public_root" 2>/dev/null; then
+  fail 'public image accepted a private firmware archive'
+fi
+rm -rf "$public_root"
+echo 'public image excludes the private package and refuses OEM firmware'

@@ -49,8 +49,8 @@ class A16FirmwareTest(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, "before disk cleanup"):
                         phases_impl.prepare_live(types.SimpleNamespace(is_protected=False))
                     disk.assert_not_called()
-                    self.assertEqual(run.call_count, 3)
-                    self.assertIn("--stage-installed", run.call_args_list[1].args[0])
+                    self.assertEqual(run.call_count, 2)
+                    self.assertIn("--stage-installed", run.call_args_list[0].args[0])
 
     def test_complete_verified_stage_passes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -75,22 +75,48 @@ class A16FirmwareTest(unittest.TestCase):
                 firmware.validate_a16_stage("extract", Path("/nonexistent-stage"))
 
 
-    def test_packaged_firmware_is_activated_before_staging(self):
+    def test_owner_firmware_stages_without_private_package(self):
         with mock.patch.object(subprocess, "run") as run, \
              mock.patch.object(firmware, "validate_a16_stage") as validate:
             stage = Path("/run/omarchy/firmware")
             firmware.prepare_a16_stage("extract", stage)
             self.assertEqual(run.call_args_list, [
-                mock.call(["/usr/lib/asus-zenbook-a16-firmware/activate-calibration"], check=True),
                 mock.call(["extract", "--stage", str(stage), "--stage-installed"], check=True),
             ])
             validate.assert_called_once_with("extract", stage)
 
-    def test_activation_failure_prevents_staging(self):
-        with mock.patch.object(subprocess, "run", side_effect=subprocess.CalledProcessError(1, "activate")) as run:
+    def test_stage_failure_prevents_validation(self):
+        with mock.patch.object(subprocess, "run", side_effect=subprocess.CalledProcessError(1, "extract")) as run, \
+             mock.patch.object(firmware, "validate_a16_stage") as validate:
             with self.assertRaises(subprocess.CalledProcessError):
                 firmware.prepare_a16_stage("extract", Path("/run/omarchy/firmware"))
             self.assertEqual(run.call_count, 1)
+            validate.assert_not_called()
+
+    def test_interactive_preflight_unlocks_only_after_missing_firmware(self):
+        stage = Path("/run/omarchy/firmware")
+        with mock.patch.object(subprocess, "run") as run, \
+             mock.patch.object(firmware, "validate_a16_stage", side_effect=[firmware.MissingFirmwareError("missing"), None]) as validate:
+            firmware.prepare_a16_stage("extract", stage, interactive=True)
+            self.assertEqual(run.call_args_list, [
+                mock.call(["extract", "--stage", str(stage), "--stage-installed"], check=True),
+                mock.call(["extract", "--stage", str(stage), "--stage-installed", "--unlock-bitlocker"], check=True),
+            ])
+            self.assertEqual(validate.call_count, 2)
+
+    def test_unlock_cancellation_stops_before_installation(self):
+        with mock.patch.object(subprocess, "run", side_effect=[None, subprocess.CalledProcessError(130, "extract")]), \
+             mock.patch.object(firmware, "validate_a16_stage", side_effect=firmware.MissingFirmwareError("missing")) as validate:
+            with self.assertRaises(subprocess.CalledProcessError):
+                firmware.prepare_a16_stage("extract", Path("/run/omarchy/firmware"), interactive=True)
+            self.assertEqual(validate.call_count, 1)
+
+    def test_complete_stage_does_not_request_a_recovery_key(self):
+        with mock.patch.object(subprocess, "run") as run, \
+             mock.patch.object(firmware, "validate_a16_stage"):
+            firmware.prepare_a16_stage("extract", Path("/run/omarchy/firmware"), interactive=True)
+            self.assertEqual(run.call_count, 1)
+            self.assertNotIn("--unlock-bitlocker", run.call_args.args[0])
 
 
 if __name__ == "__main__":

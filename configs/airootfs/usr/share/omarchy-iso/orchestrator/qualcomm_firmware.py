@@ -49,17 +49,22 @@ def validate_a16_stage(tool: str, stage: Path) -> None:
         raise MissingFirmwareError(
             "A16 firmware is missing or its staged checksum is invalid: "
             + ", ".join(unresolved)
-            + ". Installation stopped before disk cleanup. The A16 firmware "
-            "package must supply its DSP images and board calibration. Check the "
-            "installer image and its package bundle before retrying."
+            + ". Installation stopped before disk cleanup. Supply the "
+            "matching ASUS DSP images and board calibration from your own verified "
+            "source, then retry. OEM firmware is not included in the public ISO."
         )
 
 
-def prepare_a16_stage(tool: str, stage: Path) -> None:
-    """Stage the packaged board firmware before any destructive disk action."""
-    subprocess.run(["/usr/lib/asus-zenbook-a16-firmware/activate-calibration"], check=True)
+def prepare_a16_stage(tool: str, stage: Path, *, interactive: bool = False) -> None:
+    """Stage owner-provided firmware before any destructive disk action."""
     subprocess.run([tool, "--stage", str(stage), "--stage-installed"], check=True)
-    validate_a16_stage(tool, stage)
+    try:
+        validate_a16_stage(tool, stage)
+    except MissingFirmwareError:
+        if not interactive:
+            raise
+        subprocess.run([tool, "--stage", str(stage), "--stage-installed", "--unlock-bitlocker"], check=True)
+        validate_a16_stage(tool, stage)
 
 
 if __name__ == "__main__":
@@ -68,7 +73,7 @@ if __name__ == "__main__":
             tool = shutil.which("qcom-firmware-extract")
             if not tool:
                 raise RuntimeError("The installer is missing qcom-firmware-extract.")
-            prepare_a16_stage(tool, Path("/run/omarchy/firmware"))
+            prepare_a16_stage(tool, Path("/run/omarchy/firmware"), interactive=True)
     except (RuntimeError, OSError, ValueError, subprocess.CalledProcessError, KeyboardInterrupt) as error:
         print("\n" + textwrap.fill(f"Firmware setup stopped: {error}", 76), file=sys.stderr)
         print("Installation has not started.", file=sys.stderr)
